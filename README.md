@@ -13,14 +13,20 @@ routing gateway; it just shuttles bytes between two sockets.
 
 ## Why
 
-- **Single static binary**, no runtime, no config files.
+- **Single static binary**, no runtime. Run from CLI flags or a remembered
+  YAML config.
 - **Fast.** TCP relaying uses Go's `io.Copy` over `*net.TCPConn`, which on
   Linux transfers bytes in-kernel via the `splice(2)` syscall — zero userspace
   copies. `TCP_NODELAY` is enabled so small request/response payloads (Redis,
   HTTP) are not delayed by Nagle's algorithm.
+- **Built for load.** `SO_REUSEPORT` opens N listener sockets per rule so the
+  kernel load-balances accepts across cores; an optional per-rule connection cap
+  sheds load to protect against FD exhaustion; TCP keepalive reaps dead peers.
 - **Concurrent.** One lightweight goroutine per connection; thousands of
   simultaneous connections are cheap.
 - **UDP too**, with per-client NAT sessions and idle eviction (handy for DNS).
+- **Hot reload.** Edit the config and `kill -HUP` to add, remove, or change
+  rules without dropping in-flight connections.
 
 ## Install / Build
 
@@ -33,12 +39,13 @@ make build
 ## Usage
 
 ```
-proxy-port -L LISTEN=REMOTE [-L ...] [-v]
+proxy-port [-c config.yaml] [-L LISTEN=REMOTE ...] [-v]
+proxy-port init [path]      # write a starter config (the "remembered" config)
 ```
 
 Each `-L` is a forwarding rule, `LISTEN=REMOTE`. Repeat `-L` for multiple
 forwards. The protocol defaults to TCP; prefix with `tcp://` or `udp://` to be
-explicit.
+explicit. `-L` rules are appended on top of any config file.
 
 ### Examples
 
@@ -63,12 +70,67 @@ proxy-port -L 0.0.0.0:5432=db.internal:5432
 
 Add `-v` to log every connection open/close.
 
+## Config file (remembered config)
+
+Generate a commented starter config, edit it, then run from it:
+
+```bash
+proxy-port init                                   # writes ~/.config/proxy-port/config.yaml
+proxy-port -c ~/.config/proxy-port/config.yaml
+```
+
+When no `-c` is given, the config is searched for in order: `./proxy-port.yaml`,
+`$XDG_CONFIG_HOME/proxy-port/config.yaml`, `~/.config/proxy-port/config.yaml`.
+
+```yaml
+defaults:                 # applied to every rule unless the rule overrides it
+  tcp_nodelay: true       # disable Nagle for low latency on small payloads
+  tcp_keepalive: 30s      # detect dead peers; 0 disables
+  dial_timeout: 10s       # give up establishing the upstream after this long
+  max_connections: 0      # per-rule concurrent connection cap; 0 = unlimited
+  read_buffer: 0          # socket SO_RCVBUF in bytes; 0 = OS default
+  write_buffer: 0         # socket SO_SNDBUF in bytes; 0 = OS default
+  reuseport: 1            # SO_REUSEPORT listener sockets per rule (>1 scales accepts)
+  drain_timeout: 15s      # max wait for in-flight connections on stop/reload
+
+rules:
+  - name: redis
+    listen: ":6379"
+    remote: "192.168.1.10:6379"
+    max_connections: 5000 # per-rule override
+  - name: dns
+    proto: udp
+    listen: ":53"
+    remote: "8.8.8.8:53"
+
+log:
+  verbose: false
+```
+
+Durations accept Go syntax (`30s`, `1m`, `500ms`) or a bare number of seconds.
+
+### Hot reload
+
+Edit the config and send `SIGHUP`:
+
+```bash
+kill -HUP $(pgrep proxy-port)
+```
+
+Rules are diffed by listen address: unchanged rules keep serving (their live
+connections are never touched), added rules start, removed/changed rules stop
+accepting and drain. A bad edit is logged and the proxy keeps running on the
+previous config.
+
 ## Flags
 
 | Flag | Description |
 |------|-------------|
-| `-L LISTEN=REMOTE` | Forwarding rule. Repeatable. Optional `tcp://` (default) / `udp://` prefix. |
+| `-c PATH` | Path to a YAML config file (overrides the search path). |
+| `-L LISTEN=REMOTE` | Forwarding rule. Repeatable. Optional `tcp://` (default) / `udp://` prefix. Appended on top of the config. |
 | `-v` | Verbose: log each connection open and close. |
+
+Sub-command: `proxy-port init [path]` writes a starter config.
 
 ## Behaviour notes
 
@@ -79,7 +141,14 @@ Add `-v` to log every connection open/close.
   own upstream socket (symmetric-NAT style). Sessions idle for 60s are
   reclaimed.
 - `SIGINT` / `SIGTERM` triggers a graceful shutdown that stops accepting new
-  connections and drains in-flight TCP connections.
+  connections and drains in-flight TCP connections (bounded by `drain_timeout`;
+  stragglers past the deadline are force-closed).
+- `SIGHUP` reloads the config in place (see [Hot reload](#hot-reload)).
+
+## Benchmark
+
+`make load` runs a concurrent round-trip throughput benchmark through the
+forwarder in front of an in-process echo server.
 
 ## License
 
