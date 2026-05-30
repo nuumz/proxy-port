@@ -1,4 +1,23 @@
+# Binary
 /proxy-port
+/proxy-port.exe
+
+# Go build artifacts
 *.exe
 *.test
 *.out
+*.prof
+/dist/
+
+# Config files with real hosts/credentials (use *.example.yaml to share templates)
+redis-sentinel.yaml
+proxy-port.yaml
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
