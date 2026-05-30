@@ -33,8 +33,10 @@ func TestParseRule(t *testing.T) {
 			t.Errorf("ParseRule(%q): unexpected error: %v", tt.in, err)
 			continue
 		}
-		if got != tt.want {
-			t.Errorf("ParseRule(%q) = %+v, want %+v", tt.in, got, tt.want)
+		// Compare only the parsed identity fields; ParseRule also fills tunable
+		// defaults (TCPNoDelay, timeouts, ...) which these cases don't assert.
+		if got.Proto != tt.want.Proto || got.Listen != tt.want.Listen || got.Remote != tt.want.Remote {
+			t.Errorf("ParseRule(%q) = %s, want %s", tt.in, got, tt.want)
 		}
 	}
 }

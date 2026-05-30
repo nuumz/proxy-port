@@ -45,9 +45,18 @@ func TestForwardTCP(t *testing.T) {
 	probe.Close()
 	rule.Listen = localAddr
 
+	rule.TCPNoDelay = true
+	rule.DialTimeout = time.Second
+	rule.ReusePort = 1
+	rule.DrainTimeout = time.Second
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = serveTCP(ctx, rule, false) }()
+	rr := newRuleRunner(rule, false)
+	if err := rr.start(ctx); err != nil {
+		t.Fatalf("runner start: %v", err)
+	}
+	defer rr.stop(time.Second)
 
 	// Give the listener a moment to come up.
 	deadline := time.Now().Add(2 * time.Second)

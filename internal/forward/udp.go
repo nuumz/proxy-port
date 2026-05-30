@@ -24,25 +24,42 @@ type udpSession struct {
 	mu       sync.Mutex
 }
 
-// serveUDP implements a connectionless relay. Because UDP has no accept(), we
-// demultiplex on the client's source address: each distinct client gets its
-// own upstream socket so replies can be routed back correctly (classic
-// symmetric-NAT behaviour).
-func serveUDP(ctx context.Context, r Rule, verbose bool) error {
-	var lc net.ListenConfig
+// serveUDPRunner is the runner entry point for UDP rules. It binds the listen
+// socket, reports the bind outcome on errc exactly once (nil on success), and
+// then serves until ctx is cancelled. Owning the bind here lets the supervisor
+// surface bind errors synchronously while the serve loop runs in the background.
+func serveUDPRunner(ctx context.Context, r Rule, verbose bool, errc chan<- error) {
+	lc := listenConfig(r)
 	pc, err := lc.ListenPacket(ctx, "udp", r.Listen)
 	if err != nil {
-		return err
+		errc <- err
+		return
 	}
 	conn := pc.(*net.UDPConn)
-	log.Printf("listening %s", r)
+	if r.ReadBuffer > 0 {
+		_ = conn.SetReadBuffer(r.ReadBuffer)
+	}
+	if r.WriteBuffer > 0 {
+		_ = conn.SetWriteBuffer(r.WriteBuffer)
+	}
 
 	remoteAddr, err := net.ResolveUDPAddr("udp", r.Remote)
 	if err != nil {
 		_ = conn.Close()
-		return err
+		errc <- err
+		return
 	}
+	log.Printf("listening %s", r)
+	errc <- nil
 
+	serveUDP(ctx, conn, remoteAddr, r, verbose)
+}
+
+// serveUDP implements a connectionless relay over an already-bound socket.
+// Because UDP has no accept(), we demultiplex on the client's source address:
+// each distinct client gets its own upstream socket so replies can be routed
+// back correctly (classic symmetric-NAT behaviour).
+func serveUDP(ctx context.Context, conn *net.UDPConn, remoteAddr *net.UDPAddr, r Rule, verbose bool) {
 	go func() {
 		<-ctx.Done()
 		_ = conn.Close()
@@ -59,10 +76,10 @@ func serveUDP(ctx context.Context, r Rule, verbose bool) error {
 		n, client, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return
 			}
 			log.Printf("%s: read error: %v", r.Listen, err)
-			return err
+			return
 		}
 
 		key := client.String()
