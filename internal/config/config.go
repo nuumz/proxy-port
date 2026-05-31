@@ -286,7 +286,7 @@ defaults:
   max_connections: 0      # per-rule concurrent connection cap; 0 = unlimited
   read_buffer: 0          # socket SO_RCVBUF in bytes; 0 = OS default
   write_buffer: 0         # socket SO_SNDBUF in bytes; 0 = OS default
-  reuseport: 1            # SO_REUSEPORT listener sockets per rule (>1 scales accepts)
+  reuseport: 1            # SO_REUSEPORT sockets per rule (>1 spreads TCP accepts / UDP receive across cores)
   drain_timeout: 15s      # max wait for in-flight connections on stop/reload
 
 rules:

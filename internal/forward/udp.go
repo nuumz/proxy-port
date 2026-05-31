@@ -34,37 +34,6 @@ type udpSession struct {
 	lastSeen atomic.Int64
 }
 
-// serveUDPRunner is the runner entry point for UDP rules. It binds the listen
-// socket, reports the bind outcome on errc exactly once (nil on success), and
-// then serves until ctx is cancelled. Owning the bind here lets the supervisor
-// surface bind errors synchronously while the serve loop runs in the background.
-func serveUDPRunner(ctx context.Context, r Rule, verbose bool, errc chan<- error) {
-	lc := listenConfig(r)
-	pc, err := lc.ListenPacket(ctx, "udp", r.Listen)
-	if err != nil {
-		errc <- err
-		return
-	}
-	conn := pc.(*net.UDPConn)
-	if r.ReadBuffer > 0 {
-		_ = conn.SetReadBuffer(r.ReadBuffer)
-	}
-	if r.WriteBuffer > 0 {
-		_ = conn.SetWriteBuffer(r.WriteBuffer)
-	}
-
-	remoteAddr, err := net.ResolveUDPAddr("udp", r.Remote)
-	if err != nil {
-		_ = conn.Close()
-		errc <- err
-		return
-	}
-	log.Printf("listening %s", r)
-	errc <- nil
-
-	serveUDP(ctx, conn, remoteAddr, r, verbose)
-}
-
 // serveUDP implements a connectionless relay over an already-bound socket.
 // Because UDP has no accept(), we demultiplex on the client's source address:
 // each distinct client gets its own upstream socket so replies can be routed
@@ -82,6 +51,12 @@ func serveUDP(ctx context.Context, conn *net.UDPConn, remoteAddr *net.UDPAddr, r
 
 	// Periodically evict idle sessions.
 	go reapUDP(ctx, sessions, &mu, verbose, r)
+
+	// On shutdown (ctx cancelled, which closes conn and ends the loop below),
+	// close every upstream socket so its reply goroutine unblocks from
+	// upstream.Read and exits. Without this the goroutines and their FDs would
+	// leak across a reload that removes or replaces this rule.
+	defer closeSessions(sessions, &mu)
 
 	buf := make([]byte, udpBufSize)
 	for {
@@ -160,6 +135,17 @@ func reapUDP(ctx context.Context, sessions map[netip.AddrPort]*udpSession, mu *s
 			}
 			mu.Unlock()
 		}
+	}
+}
+
+// closeSessions tears down every live session's upstream socket. Called when a
+// serve loop exits so the per-client reply goroutines unblock and finish.
+func closeSessions(sessions map[netip.AddrPort]*udpSession, mu *sync.Mutex) {
+	mu.Lock()
+	defer mu.Unlock()
+	for key, sess := range sessions {
+		_ = sess.upstream.Close()
+		delete(sessions, key)
 	}
 }
 

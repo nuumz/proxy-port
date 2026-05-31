@@ -9,6 +9,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// reusePortAvailable reports whether this platform can open more than one
+// listener socket on the same address via SO_REUSEPORT. listenerCount uses it
+// to clamp reuseport>1 to a single socket where the option is unavailable.
+const reusePortAvailable = true
+
 // listenConfig builds a net.ListenConfig whose Control hook sets socket options
 // before bind. SO_REUSEADDR is always set so a restart can rebind immediately;
 // SO_REUSEPORT is set when the rule asks for more than one listener socket,

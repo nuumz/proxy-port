@@ -19,12 +19,15 @@ routing gateway; it just shuttles bytes between two sockets.
   Linux transfers bytes in-kernel via the `splice(2)` syscall — zero userspace
   copies. `TCP_NODELAY` is enabled so small request/response payloads (Redis,
   HTTP) are not delayed by Nagle's algorithm.
-- **Built for load.** `SO_REUSEPORT` opens N listener sockets per rule so the
-  kernel load-balances accepts across cores; an optional per-rule connection cap
-  sheds load to protect against FD exhaustion; TCP keepalive reaps dead peers.
+- **Built for load.** `SO_REUSEPORT` opens N sockets per rule so the kernel
+  spreads work across cores — TCP accepts for TCP rules, the datagram receive
+  loop for UDP rules; an optional per-rule connection cap sheds load to protect
+  against FD exhaustion; TCP keepalive reaps dead peers.
 - **Concurrent.** One lightweight goroutine per connection; thousands of
   simultaneous connections are cheap.
 - **UDP too**, with per-client NAT sessions and idle eviction (handy for DNS).
+  With `reuseport > 1` each receive loop owns a private session map, so the hot
+  path scales across cores with no shared locking.
 - **Hot reload.** Edit the config and `kill -HUP` to add, remove, or change
   rules without dropping in-flight connections.
 
@@ -90,7 +93,7 @@ defaults:                 # applied to every rule unless the rule overrides it
   max_connections: 0      # per-rule concurrent connection cap; 0 = unlimited
   read_buffer: 0          # socket SO_RCVBUF in bytes; 0 = OS default
   write_buffer: 0         # socket SO_SNDBUF in bytes; 0 = OS default
-  reuseport: 1            # SO_REUSEPORT listener sockets per rule (>1 scales accepts)
+  reuseport: 1            # SO_REUSEPORT sockets per rule (>1 spreads TCP accepts / UDP receive across cores)
   drain_timeout: 15s      # max wait for in-flight connections on stop/reload
 
 rules:

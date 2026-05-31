@@ -4,6 +4,11 @@ package forward
 
 import "net"
 
+// reusePortAvailable is false here: without SO_REUSEPORT a second bind to the
+// same address fails, so listenerCount clamps reuseport>1 to a single socket
+// and the proxy degrades to one listener instead of failing to start.
+const reusePortAvailable = false
+
 // listenConfig is the portable fallback for platforms without unix socket
 // options (e.g. Windows, Plan 9). SO_REUSEPORT is unavailable, so reuseport>1
 // silently degrades to a single listener; behaviour is otherwise identical.
