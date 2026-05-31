@@ -104,7 +104,7 @@ func BenchmarkForwardUDP(b *testing.B) {
 	}()
 
 	rule := Rule{
-		Proto: "udp", Listen: "127.0.0.1:0", Remote: up.LocalAddr().String(),
+		Proto: "udp", Listen: "127.0.0.1:0", Upstreams: ups(up.LocalAddr().String()),
 		DialTimeout: time.Second, ReusePort: 1, DrainTimeout: time.Second,
 	}
 	probe, _ := net.ListenUDP("udp", upAddr)

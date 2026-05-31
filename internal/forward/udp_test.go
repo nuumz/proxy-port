@@ -82,7 +82,7 @@ func TestForwardUDP(t *testing.T) {
 	defer stop()
 
 	rule := Rule{
-		Proto: "udp", Listen: freeUDPAddr(t), Remote: remote,
+		Proto: "udp", Listen: freeUDPAddr(t), Upstreams: ups(remote),
 		DialTimeout: time.Second, ReusePort: 1, DrainTimeout: time.Second,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -107,7 +107,7 @@ func TestForwardUDPReusePort(t *testing.T) {
 	defer stop()
 
 	rule := Rule{
-		Proto: "udp", Listen: freeUDPAddr(t), Remote: remote,
+		Proto: "udp", Listen: freeUDPAddr(t), Upstreams: ups(remote),
 		DialTimeout: time.Second, ReusePort: 4, DrainTimeout: time.Second,
 	}
 	ctx, cancel := context.WithCancel(context.Background())

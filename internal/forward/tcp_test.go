@@ -34,7 +34,7 @@ func TestForwardTCP(t *testing.T) {
 	}()
 
 	// Forwarder listening on an ephemeral local port -> upstream.
-	rule := Rule{Proto: "tcp", Listen: "127.0.0.1:0", Remote: upstream.Addr().String()}
+	rule := Rule{Proto: "tcp", Listen: "127.0.0.1:0", Upstreams: ups(upstream.Addr().String())}
 	// We need the chosen local port, so bind it ourselves and hand serveTCP a
 	// fixed address by reusing the resolved port.
 	probe, err := net.Listen("tcp", "127.0.0.1:0")

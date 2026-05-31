@@ -22,6 +22,9 @@ type ruleRunner struct {
 	// sem caps concurrent connections per rule. nil means unlimited.
 	sem chan struct{}
 
+	// pool load-balances new connections/sessions across the rule's upstreams.
+	pool *pool
+
 	listeners []net.Listener
 
 	cancel context.CancelFunc // cancels the runner's own context
@@ -42,6 +45,15 @@ func newRuleRunner(r Rule, verbose bool) *ruleRunner {
 // loop(s). It returns once binding succeeds (or fails) so the supervisor can
 // surface bind errors synchronously.
 func (rr *ruleRunner) start(parent context.Context) error {
+	// Build the upstream pool first: a resolve/strategy error here is a config
+	// fault and must fail the start synchronously (for udp it also pre-resolves
+	// upstream addresses so sessions never resolve on the hot path).
+	p, err := newPool(rr.rule.Upstreams, rr.rule.Balance, rr.rule.FailCooldown, rr.rule.Proto)
+	if err != nil {
+		return err
+	}
+	rr.pool = p
+
 	ctx, cancel := context.WithCancel(parent)
 	rr.cancel = cancel
 
@@ -139,18 +151,12 @@ func (rr *ruleRunner) acceptLoop(ctx context.Context, ln net.Listener) {
 			if rr.sem != nil {
 				defer func() { <-rr.sem }()
 			}
-			handleTCP(ctx, id, client, rr.rule, rr.verbose)
+			handleTCP(ctx, id, client, rr.rule, rr.pool, rr.verbose)
 		}()
 	}
 }
 
 func (rr *ruleRunner) startUDP(ctx context.Context) error {
-	remoteAddr, err := net.ResolveUDPAddr("udp", rr.rule.Remote)
-	if err != nil {
-		rr.cancel()
-		return err
-	}
-
 	// Open N reuseport sockets and bind them all before launching any serve
 	// loop, so a bind failure is reported synchronously (like startTCP) and we
 	// can roll back cleanly without leaking FDs.
@@ -191,7 +197,7 @@ func (rr *ruleRunner) startUDP(ctx context.Context) error {
 		rr.loopWG.Add(1)
 		go func() {
 			defer rr.loopWG.Done()
-			serveUDP(ctx, conn, remoteAddr, rr.rule, rr.verbose)
+			serveUDP(ctx, conn, rr.rule, rr.pool, rr.verbose)
 		}()
 	}
 	return nil

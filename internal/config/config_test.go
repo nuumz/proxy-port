@@ -3,8 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/nuumz/proxy-port/internal/forward"
 )
 
 // writeTmp writes content to a temp file and returns its path.
@@ -89,13 +92,58 @@ rules:
 	}
 }
 
+// TestLoadBalanceConfig checks a rule with `remotes` + `balance` resolves to a
+// weighted upstream set, while `remote` stays a single-upstream shorthand.
+func TestLoadBalanceConfig(t *testing.T) {
+	path := writeTmp(t, `
+defaults:
+  balance: iphash
+rules:
+  - name: api
+    listen: ":8080"
+    balance: least_conn
+    remotes:
+      - "10.0.0.1:80"
+      - "10.0.0.2:80#3"
+  - name: redis
+    listen: ":6379"
+    remote: "10.0.0.9:6379"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	rules := cfg.Resolve()
+
+	api := rules[0]
+	if api.Balance != "least_conn" {
+		t.Errorf("api Balance = %q, want least_conn (per-rule override)", api.Balance)
+	}
+	want := []forward.Upstream{{Addr: "10.0.0.1:80", Weight: 1}, {Addr: "10.0.0.2:80", Weight: 3}}
+	if !reflect.DeepEqual(api.Upstreams, want) {
+		t.Errorf("api Upstreams = %v, want %v", api.Upstreams, want)
+	}
+
+	redis := rules[1]
+	if redis.Balance != "iphash" {
+		t.Errorf("redis Balance = %q, want inherited iphash", redis.Balance)
+	}
+	if len(redis.Upstreams) != 1 || redis.Upstreams[0].Addr != "10.0.0.9:6379" {
+		t.Errorf("redis Upstreams = %v, want single 10.0.0.9:6379", redis.Upstreams)
+	}
+}
+
 func TestValidateErrors(t *testing.T) {
 	cases := map[string]string{
-		"no rules":       "defaults: {}\n",
-		"empty remote":   "rules:\n  - listen: \":1\"\n",
-		"bad proto":      "rules:\n  - proto: sctp\n    listen: \":1\"\n    remote: \"h:1\"\n",
-		"duplicate key":  "rules:\n  - listen: \":1\"\n    remote: \"a:1\"\n  - listen: \":1\"\n    remote: \"b:1\"\n",
-		"reuseport zero": "rules:\n  - listen: \":1\"\n    remote: \"h:1\"\n    reuseport: 0\n",
+		"no rules":        "defaults: {}\n",
+		"empty remote":    "rules:\n  - listen: \":1\"\n",
+		"bad proto":       "rules:\n  - proto: sctp\n    listen: \":1\"\n    remote: \"h:1\"\n",
+		"duplicate key":   "rules:\n  - listen: \":1\"\n    remote: \"a:1\"\n  - listen: \":1\"\n    remote: \"b:1\"\n",
+		"reuseport zero":  "rules:\n  - listen: \":1\"\n    remote: \"h:1\"\n    reuseport: 0\n",
+		"remote+remotes":  "rules:\n  - listen: \":1\"\n    remote: \"a:1\"\n    remotes: [\"b:1\"]\n",
+		"bad balance":     "rules:\n  - listen: \":1\"\n    remote: \"h:1\"\n    balance: bogus\n",
+		"bad weight":      "rules:\n  - listen: \":1\"\n    remotes: [\"h:1#0\"]\n",
+		"bad default bal": "defaults:\n  balance: nope\nrules:\n  - listen: \":1\"\n    remote: \"h:1\"\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
