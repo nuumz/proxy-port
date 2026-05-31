@@ -19,12 +19,19 @@ routing gateway; it just shuttles bytes between two sockets.
   Linux transfers bytes in-kernel via the `splice(2)` syscall — zero userspace
   copies. `TCP_NODELAY` is enabled so small request/response payloads (Redis,
   HTTP) are not delayed by Nagle's algorithm.
-- **Built for load.** `SO_REUSEPORT` opens N listener sockets per rule so the
-  kernel load-balances accepts across cores; an optional per-rule connection cap
-  sheds load to protect against FD exhaustion; TCP keepalive reaps dead peers.
+- **Built for load.** `SO_REUSEPORT` opens N sockets per rule so the kernel
+  spreads work across cores — TCP accepts for TCP rules, the datagram receive
+  loop for UDP rules; an optional per-rule connection cap sheds load to protect
+  against FD exhaustion; TCP keepalive reaps dead peers.
 - **Concurrent.** One lightweight goroutine per connection; thousands of
   simultaneous connections are cheap.
 - **UDP too**, with per-client NAT sessions and idle eviction (handy for DNS).
+  With `reuseport > 1` each receive loop owns a private session map, so the hot
+  path scales across cores with no shared locking.
+- **Load balancing.** Point a rule at several upstreams and pick a strategy:
+  `weighted` round-robin, `least_conn`, or `iphash` (client affinity). Selection
+  is lock-free and allocation-free; a backend that fails to dial is parked for a
+  cooldown and traffic fails over to the rest (passive health).
 - **Hot reload.** Edit the config and `kill -HUP` to add, remove, or change
   rules without dropping in-flight connections.
 
@@ -68,6 +75,12 @@ Bind to all interfaces (so other hosts on your LAN can reach the remote too):
 proxy-port -L 0.0.0.0:5432=db.internal:5432
 ```
 
+Load-balance across several upstreams (comma-separated; `#N` sets a weight):
+
+```bash
+proxy-port -L :8080=10.0.0.1:80,10.0.0.2:80,10.0.0.3:80#2
+```
+
 Add `-v` to log every connection open/close.
 
 ## Config file (remembered config)
@@ -87,17 +100,26 @@ defaults:                 # applied to every rule unless the rule overrides it
   tcp_nodelay: true       # disable Nagle for low latency on small payloads
   tcp_keepalive: 30s      # detect dead peers; 0 disables
   dial_timeout: 10s       # give up establishing the upstream after this long
+  balance: weighted       # multi-upstream balancing: weighted | least_conn | iphash
+  fail_cooldown: 10s      # park a backend this long after a dial failure before retrying it
   max_connections: 0      # per-rule concurrent connection cap; 0 = unlimited
   read_buffer: 0          # socket SO_RCVBUF in bytes; 0 = OS default
   write_buffer: 0         # socket SO_SNDBUF in bytes; 0 = OS default
-  reuseport: 1            # SO_REUSEPORT listener sockets per rule (>1 scales accepts)
+  reuseport: 1            # SO_REUSEPORT sockets per rule (>1 spreads TCP accepts / UDP receive across cores)
   drain_timeout: 15s      # max wait for in-flight connections on stop/reload
 
 rules:
   - name: redis
     listen: ":6379"
-    remote: "192.168.1.10:6379"
-    max_connections: 5000 # per-rule override
+    remote: "192.168.1.10:6379"   # single upstream
+    max_connections: 5000         # per-rule override
+  - name: api                     # load-balanced across three backends
+    listen: ":8080"
+    balance: least_conn           # per-rule override of the default strategy
+    remotes:
+      - "10.0.0.1:80"
+      - "10.0.0.2:80"
+      - "10.0.0.3:80#2"           # weight 2: takes twice the share (weighted strategy)
   - name: dns
     proto: udp
     listen: ":53"
@@ -139,7 +161,14 @@ Sub-command: `proxy-port init [path]` writes a starter config.
   too completes. This is correct for request/response protocols.
 - **UDP** is connectionless, so each distinct client source address gets its
   own upstream socket (symmetric-NAT style). Sessions idle for 60s are
-  reclaimed.
+  reclaimed. Under load balancing, a UDP client sticks to the upstream chosen
+  when its session opened (per-client affinity for the session's lifetime).
+- **Load balancing** distributes *new* connections (TCP) or *new* sessions
+  (UDP) across a rule's upstreams. `weighted` (default) is round-robin honouring
+  per-upstream `#weight`; `least_conn` sends to the backend with the fewest live
+  connections; `iphash` pins each client IP to a stable upstream. A dial failure
+  parks that backend for `fail_cooldown` and the request fails over to another;
+  the backend is retried once the cooldown elapses.
 - `SIGINT` / `SIGTERM` triggers a graceful shutdown that stops accepting new
   connections and drains in-flight TCP connections (bounded by `drain_timeout`;
   stragglers past the deadline are force-closed).

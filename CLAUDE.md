@@ -39,11 +39,19 @@ Request path: `client → listener (per rule) → handleTCP/serveUDP → upstrea
   - `ruleRunner` owns the listener socket(s), a per-rule concurrency semaphore, and two
     WaitGroups: `loopWG` (accept loops / UDP serve loop) and `connWG` (in-flight TCP
     handlers). Their separate lifetimes are what make reload/shutdown non-disruptive.
-  - `tcp.go` — `handleTCP` relays both directions with `io.Copy` (uses `splice(2)`
-    in-kernel on Linux) and **half-close**: when one side EOFs, the other's write half is
-    closed so request/response protocols see EOF without a premature full teardown.
+  - `tcp.go` — `handleTCP` picks an upstream from the rule's `pool`, then relays both
+    directions with `io.Copy` (uses `splice(2)` in-kernel on Linux) and **half-close**:
+    when one side EOFs, the other's write half is closed so request/response protocols see
+    EOF without a premature full teardown.
   - `udp.go` — connectionless: demux on client source addr, one upstream `*net.UDPConn`
-    per client (symmetric-NAT style), idle sessions reaped after 60s.
+    per client (symmetric-NAT style), pinned to one balanced upstream for the session,
+    idle sessions reaped after 60s.
+  - `pool.go` — per-rule load balancer over `Rule.Upstreams`. Lock-free, alloc-free
+    `pick`: `weighted` (round-robin over a weight-expanded index slice), `least_conn`
+    (atomic in-flight counters), `iphash` (FNV of client IP → stable upstream). Passive
+    health only: a failed dial parks a backend via an atomic `downUntil` deadline for
+    `FailCooldown`; callers fail over to the next and retry it after the cooldown. One
+    `pool` is shared across a rule's accept/serve loops so balancing state is global.
   - `listener_unix.go` / `listener_other.go` — build-tagged socket tuning. Unix sets
     SO_REUSEADDR always and SO_REUSEPORT when `reuseport > 1`. Non-unix degrades reuseport
     to a single listener silently; keep both files in sync when changing `tuneConn`.

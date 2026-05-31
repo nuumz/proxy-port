@@ -8,21 +8,19 @@ import (
 	"sync"
 )
 
-// handleTCP relays one accepted client connection to the rule's upstream,
-// applying the rule's socket tunables to both ends. The runner owns the accept
-// loop, semaphore and lifetime; this function just moves bytes.
-func handleTCP(ctx context.Context, id uint64, client net.Conn, r Rule, verbose bool) {
+// handleTCP relays one accepted client connection to one of the rule's
+// upstreams (chosen by the pool), applying the rule's socket tunables to both
+// ends. The runner owns the accept loop, semaphore and lifetime; this function
+// picks a backend, moves bytes, and releases the backend on close.
+func handleTCP(ctx context.Context, id uint64, client net.Conn, r Rule, p *pool, verbose bool) {
 	defer client.Close()
 	tuneConn(client, r)
 
-	var d net.Dialer
-	dialCtx, cancel := context.WithTimeout(ctx, r.DialTimeout)
-	upstream, err := d.DialContext(dialCtx, "tcp", r.Remote)
-	cancel()
-	if err != nil {
-		log.Printf("[%s#%d] dial %s failed: %v", r.Listen, id, r.Remote, err)
+	upstream, idx, ok := dialUpstream(ctx, id, client, r, p)
+	if !ok {
 		return
 	}
+	defer p.done(idx)
 	defer upstream.Close()
 	tuneConn(upstream, r)
 
@@ -58,6 +56,36 @@ func handleTCP(ctx context.Context, id uint64, client net.Conn, r Rule, verbose 
 	if verbose {
 		log.Printf("[%s#%d] close", r.Listen, id)
 	}
+}
+
+// dialUpstream picks an upstream from the pool and dials it, retrying other
+// backends on failure (passive health: a failed dial parks that backend for the
+// cooldown window). It returns the live conn and the pool index to release on
+// close, or ok=false when no upstream could be reached.
+func dialUpstream(ctx context.Context, id uint64, client net.Conn, r Rule, p *pool) (net.Conn, int, bool) {
+	key := clientKeyTCP(client)
+	var d net.Dialer
+	// At most one attempt per upstream: a parked backend is skipped by pick, so
+	// the loop converges instead of hammering a dead one.
+	for attempt := 0; attempt < p.len(); attempt++ {
+		idx, ok := p.pick(key)
+		if !ok {
+			break
+		}
+		addr := p.addr(idx)
+		dialCtx, cancel := context.WithTimeout(ctx, r.DialTimeout)
+		upstream, err := d.DialContext(dialCtx, "tcp", addr)
+		cancel()
+		if err != nil {
+			log.Printf("[%s#%d] dial %s failed: %v", r.Listen, id, addr, err)
+			p.fail(idx)
+			continue
+		}
+		p.markUp(idx)
+		return upstream, idx, true
+	}
+	log.Printf("[%s#%d] no healthy upstream", r.Listen, id)
+	return nil, 0, false
 }
 
 // pipe copies from src to dst, then signals end-of-data to dst by closing its

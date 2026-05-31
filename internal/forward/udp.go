@@ -28,41 +28,13 @@ const (
 var udpBufPool = sync.Pool{New: func() any { b := make([]byte, udpBufSize); return &b }}
 
 // udpSession tracks one client's NAT mapping to a dedicated upstream socket.
+// poolIdx records which balanced upstream it is pinned to (UDP affinity is
+// sticky for the session's lifetime) so the pool slot is released on close.
 // lastSeen is a unix-nanos atomic so touch() on the hot path is lock-free.
 type udpSession struct {
 	upstream *net.UDPConn
+	poolIdx  int
 	lastSeen atomic.Int64
-}
-
-// serveUDPRunner is the runner entry point for UDP rules. It binds the listen
-// socket, reports the bind outcome on errc exactly once (nil on success), and
-// then serves until ctx is cancelled. Owning the bind here lets the supervisor
-// surface bind errors synchronously while the serve loop runs in the background.
-func serveUDPRunner(ctx context.Context, r Rule, verbose bool, errc chan<- error) {
-	lc := listenConfig(r)
-	pc, err := lc.ListenPacket(ctx, "udp", r.Listen)
-	if err != nil {
-		errc <- err
-		return
-	}
-	conn := pc.(*net.UDPConn)
-	if r.ReadBuffer > 0 {
-		_ = conn.SetReadBuffer(r.ReadBuffer)
-	}
-	if r.WriteBuffer > 0 {
-		_ = conn.SetWriteBuffer(r.WriteBuffer)
-	}
-
-	remoteAddr, err := net.ResolveUDPAddr("udp", r.Remote)
-	if err != nil {
-		_ = conn.Close()
-		errc <- err
-		return
-	}
-	log.Printf("listening %s", r)
-	errc <- nil
-
-	serveUDP(ctx, conn, remoteAddr, r, verbose)
 }
 
 // serveUDP implements a connectionless relay over an already-bound socket.
@@ -71,7 +43,8 @@ func serveUDPRunner(ctx context.Context, r Rule, verbose bool, errc chan<- error
 // back correctly (classic symmetric-NAT behaviour). The client address is a
 // netip.AddrPort — a comparable value used directly as the map key, so the hot
 // read path neither allocates a *net.UDPAddr nor stringifies it per datagram.
-func serveUDP(ctx context.Context, conn *net.UDPConn, remoteAddr *net.UDPAddr, r Rule, verbose bool) {
+// Each client is pinned to one balanced upstream for the session's lifetime.
+func serveUDP(ctx context.Context, conn *net.UDPConn, r Rule, p *pool, verbose bool) {
 	go func() {
 		<-ctx.Done()
 		_ = conn.Close()
@@ -81,7 +54,14 @@ func serveUDP(ctx context.Context, conn *net.UDPConn, remoteAddr *net.UDPAddr, r
 	var mu sync.Mutex
 
 	// Periodically evict idle sessions.
-	go reapUDP(ctx, sessions, &mu, verbose, r)
+	go reapUDP(ctx, sessions, &mu, p, verbose, r)
+
+	// On shutdown (ctx cancelled, which closes conn and ends the loop below),
+	// close every upstream socket so its reply goroutine unblocks from
+	// upstream.Read and exits, and release its pool slot. Without this the
+	// goroutines and FDs would leak across a reload that removes/replaces this
+	// rule.
+	defer closeSessions(sessions, &mu, p)
 
 	buf := make([]byte, udpBufSize)
 	for {
@@ -97,17 +77,25 @@ func serveUDP(ctx context.Context, conn *net.UDPConn, remoteAddr *net.UDPAddr, r
 		mu.Lock()
 		sess := sessions[client]
 		if sess == nil {
-			up, derr := net.DialUDP("udp", nil, remoteAddr)
-			if derr != nil {
+			idx, ok := p.pick(clientKeyUDP(client.Addr()))
+			if !ok {
 				mu.Unlock()
-				log.Printf("%s: dial %s failed: %v", r.Listen, r.Remote, derr)
+				log.Printf("%s: no healthy upstream for %s", r.Listen, client)
 				continue
 			}
-			sess = &udpSession{upstream: up}
+			up, derr := net.DialUDP("udp", nil, p.udpAddr(idx))
+			if derr != nil {
+				p.fail(idx)
+				mu.Unlock()
+				log.Printf("%s: dial %s failed: %v", r.Listen, p.addr(idx), derr)
+				continue
+			}
+			p.markUp(idx)
+			sess = &udpSession{upstream: up, poolIdx: idx}
 			sess.touch()
 			sessions[client] = sess
 			if verbose {
-				log.Printf("[%s udp] open %s <-> %s", r.Listen, client, r.Remote)
+				log.Printf("[%s udp] open %s <-> %s", r.Listen, client, p.addr(idx))
 			}
 			// Pump upstream replies back to this client.
 			go relayUDPReplies(conn, up, client, sess)
@@ -139,7 +127,7 @@ func relayUDPReplies(client *net.UDPConn, upstream *net.UDPConn, dst netip.AddrP
 	}
 }
 
-func reapUDP(ctx context.Context, sessions map[netip.AddrPort]*udpSession, mu *sync.Mutex, verbose bool, r Rule) {
+func reapUDP(ctx context.Context, sessions map[netip.AddrPort]*udpSession, mu *sync.Mutex, p *pool, verbose bool, r Rule) {
 	ticker := time.NewTicker(udpIdleTimeout / 2)
 	defer ticker.Stop()
 	for {
@@ -152,6 +140,7 @@ func reapUDP(ctx context.Context, sessions map[netip.AddrPort]*udpSession, mu *s
 			for key, sess := range sessions {
 				if now.Sub(sess.seen()) > udpIdleTimeout {
 					_ = sess.upstream.Close()
+					p.done(sess.poolIdx)
 					delete(sessions, key)
 					if verbose {
 						log.Printf("[%s udp] idle close %s", r.Listen, key)
@@ -160,6 +149,19 @@ func reapUDP(ctx context.Context, sessions map[netip.AddrPort]*udpSession, mu *s
 			}
 			mu.Unlock()
 		}
+	}
+}
+
+// closeSessions tears down every live session's upstream socket and releases
+// its pool slot. Called when a serve loop exits so the per-client reply
+// goroutines unblock and finish.
+func closeSessions(sessions map[netip.AddrPort]*udpSession, mu *sync.Mutex, p *pool) {
+	mu.Lock()
+	defer mu.Unlock()
+	for key, sess := range sessions {
+		_ = sess.upstream.Close()
+		p.done(sess.poolIdx)
+		delete(sessions, key)
 	}
 }
 

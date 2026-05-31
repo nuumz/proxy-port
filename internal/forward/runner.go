@@ -22,6 +22,9 @@ type ruleRunner struct {
 	// sem caps concurrent connections per rule. nil means unlimited.
 	sem chan struct{}
 
+	// pool load-balances new connections/sessions across the rule's upstreams.
+	pool *pool
+
 	listeners []net.Listener
 
 	cancel context.CancelFunc // cancels the runner's own context
@@ -42,6 +45,15 @@ func newRuleRunner(r Rule, verbose bool) *ruleRunner {
 // loop(s). It returns once binding succeeds (or fails) so the supervisor can
 // surface bind errors synchronously.
 func (rr *ruleRunner) start(parent context.Context) error {
+	// Build the upstream pool first: a resolve/strategy error here is a config
+	// fault and must fail the start synchronously (for udp it also pre-resolves
+	// upstream addresses so sessions never resolve on the hot path).
+	p, err := newPool(rr.rule.Upstreams, rr.rule.Balance, rr.rule.FailCooldown, rr.rule.Proto)
+	if err != nil {
+		return err
+	}
+	rr.pool = p
+
 	ctx, cancel := context.WithCancel(parent)
 	rr.cancel = cancel
 
@@ -51,11 +63,22 @@ func (rr *ruleRunner) start(parent context.Context) error {
 	return rr.startTCP(ctx)
 }
 
-func (rr *ruleRunner) startTCP(ctx context.Context) error {
-	n := rr.rule.ReusePort
+// listenerCount returns how many SO_REUSEPORT sockets to open for a rule. It
+// clamps to at least one and, on platforms without SO_REUSEPORT, to exactly one
+// so reuseport>1 degrades to a single socket instead of failing the second bind.
+func listenerCount(r Rule) int {
+	n := r.ReusePort
 	if n < 1 {
 		n = 1
 	}
+	if !reusePortAvailable && n > 1 {
+		n = 1
+	}
+	return n
+}
+
+func (rr *ruleRunner) startTCP(ctx context.Context) error {
+	n := listenerCount(rr.rule)
 	lc := listenConfig(rr.rule)
 	for i := 0; i < n; i++ {
 		ln, err := lc.Listen(ctx, "tcp", rr.rule.Listen)
@@ -128,24 +151,54 @@ func (rr *ruleRunner) acceptLoop(ctx context.Context, ln net.Listener) {
 			if rr.sem != nil {
 				defer func() { <-rr.sem }()
 			}
-			handleTCP(ctx, id, client, rr.rule, rr.verbose)
+			handleTCP(ctx, id, client, rr.rule, rr.pool, rr.verbose)
 		}()
 	}
 }
 
 func (rr *ruleRunner) startUDP(ctx context.Context) error {
-	rr.loopWG.Add(1)
-	errc := make(chan error, 1)
-	go func() {
-		defer rr.loopWG.Done()
-		// serveUDP blocks; it signals a bind error (if any) before looping.
-		serveUDPRunner(ctx, rr.rule, rr.verbose, errc)
-	}()
-	// serveUDPRunner pushes a nil (bound OK) or an error on errc, exactly once,
-	// before it starts serving.
-	if err := <-errc; err != nil {
-		rr.cancel()
-		return err
+	// Open N reuseport sockets and bind them all before launching any serve
+	// loop, so a bind failure is reported synchronously (like startTCP) and we
+	// can roll back cleanly without leaking FDs.
+	n := listenerCount(rr.rule)
+	lc := listenConfig(rr.rule)
+	conns := make([]*net.UDPConn, 0, n)
+	for i := 0; i < n; i++ {
+		pc, err := lc.ListenPacket(ctx, "udp", rr.rule.Listen)
+		if err != nil {
+			for _, c := range conns {
+				_ = c.Close()
+			}
+			rr.cancel()
+			return err
+		}
+		conn := pc.(*net.UDPConn)
+		if rr.rule.ReadBuffer > 0 {
+			_ = conn.SetReadBuffer(rr.rule.ReadBuffer)
+		}
+		if rr.rule.WriteBuffer > 0 {
+			_ = conn.SetWriteBuffer(rr.rule.WriteBuffer)
+		}
+		conns = append(conns, conn)
+	}
+
+	if n > 1 {
+		log.Printf("listening %s (reuseport x%d)", rr.rule, n)
+	} else {
+		log.Printf("listening %s", rr.rule)
+	}
+
+	// One serve loop per socket. The kernel hashes each client's 4-tuple to a
+	// fixed reuseport socket, so all of a client's datagrams land on the same
+	// loop — letting every loop own a private session map with no cross-core
+	// locking, and spreading the receive path across cores.
+	for _, conn := range conns {
+		conn := conn
+		rr.loopWG.Add(1)
+		go func() {
+			defer rr.loopWG.Done()
+			serveUDP(ctx, conn, rr.rule, rr.pool, rr.verbose)
+		}()
 	}
 	return nil
 }

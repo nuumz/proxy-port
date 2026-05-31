@@ -45,9 +45,17 @@ func freePort(t testing.TB) string {
 	return addr
 }
 
+func ups(addrs ...string) []Upstream {
+	u := make([]Upstream, len(addrs))
+	for i, a := range addrs {
+		u[i] = Upstream{Addr: a, Weight: 1}
+	}
+	return u
+}
+
 func baseRule(listen, remote string) Rule {
 	return Rule{
-		Proto: "tcp", Listen: listen, Remote: remote,
+		Proto: "tcp", Listen: listen, Upstreams: ups(remote),
 		TCPNoDelay: true, DialTimeout: time.Second, ReusePort: 1, DrainTimeout: time.Second,
 	}
 }

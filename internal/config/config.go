@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -29,6 +30,8 @@ type Defaults struct {
 	TCPNoDelay   bool     `yaml:"tcp_nodelay"`
 	KeepAlive    Duration `yaml:"tcp_keepalive"`   // 0 disables keepalive
 	DialTimeout  Duration `yaml:"dial_timeout"`    // upstream dial timeout
+	Balance      string   `yaml:"balance"`         // weighted (default) | least_conn | iphash
+	FailCooldown Duration `yaml:"fail_cooldown"`   // how long a backend stays down after a dial failure
 	MaxConns     int      `yaml:"max_connections"` // 0 = unlimited
 	ReadBuffer   int      `yaml:"read_buffer"`     // 0 = OS default (bytes)
 	WriteBuffer  int      `yaml:"write_buffer"`    // 0 = OS default (bytes)
@@ -39,14 +42,17 @@ type Defaults struct {
 // RuleSpec mirrors Defaults with pointer overrides so "unset" is distinct from
 // "explicit zero". Resolve fills unset fields from Defaults.
 type RuleSpec struct {
-	Name   string `yaml:"name"`
-	Proto  string `yaml:"proto"` // tcp (default) or udp
-	Listen string `yaml:"listen"`
-	Remote string `yaml:"remote"`
+	Name    string   `yaml:"name"`
+	Proto   string   `yaml:"proto"` // tcp (default) or udp
+	Listen  string   `yaml:"listen"`
+	Remote  string   `yaml:"remote"`  // single upstream; shorthand for a one-element remotes
+	Remotes []string `yaml:"remotes"` // load-balanced upstreams, each "addr" or "addr#weight"
 
 	TCPNoDelay   *bool     `yaml:"tcp_nodelay"`
 	KeepAlive    *Duration `yaml:"tcp_keepalive"`
 	DialTimeout  *Duration `yaml:"dial_timeout"`
+	Balance      *string   `yaml:"balance"`
+	FailCooldown *Duration `yaml:"fail_cooldown"`
 	MaxConns     *int      `yaml:"max_connections"`
 	ReadBuffer   *int      `yaml:"read_buffer"`
 	WriteBuffer  *int      `yaml:"write_buffer"`
@@ -99,6 +105,8 @@ func builtinDefaults() Defaults {
 		TCPNoDelay:   true,
 		KeepAlive:    Duration(30 * time.Second),
 		DialTimeout:  Duration(10 * time.Second),
+		Balance:      forward.BalanceWeighted,
+		FailCooldown: Duration(10 * time.Second),
 		MaxConns:     0,
 		ReadBuffer:   0,
 		WriteBuffer:  0,
@@ -126,6 +134,12 @@ func Load(path string) (*Config, error) {
 	if c.Defaults.ReusePort == 0 {
 		c.Defaults.ReusePort = 1
 	}
+	if c.Defaults.Balance == "" {
+		c.Defaults.Balance = forward.BalanceWeighted
+	}
+	if c.Defaults.FailCooldown == 0 {
+		c.Defaults.FailCooldown = Duration(10 * time.Second)
+	}
 
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -151,8 +165,11 @@ func (c *Config) Validate() error {
 		if rs.Listen == "" {
 			return fmt.Errorf("rule %d (%s): empty listen address", i, rs.Name)
 		}
-		if rs.Remote == "" {
-			return fmt.Errorf("rule %d (%s): empty remote address", i, rs.Name)
+		if _, err := rs.upstreamSpecs(); err != nil {
+			return fmt.Errorf("rule %d (%s): %v", i, rs.Name, err)
+		}
+		if rs.Balance != nil && !forward.ValidBalance(*rs.Balance) {
+			return fmt.Errorf("rule %d (%s): unknown balance %q (want weighted, least_conn or iphash)", i, rs.Name, *rs.Balance)
 		}
 		if rs.ReusePort != nil && *rs.ReusePort < 1 {
 			return fmt.Errorf("rule %d (%s): reuseport must be >= 1", i, rs.Name)
@@ -166,7 +183,39 @@ func (c *Config) Validate() error {
 	if c.Defaults.ReusePort < 1 {
 		return fmt.Errorf("defaults.reuseport must be >= 1")
 	}
+	if !forward.ValidBalance(c.Defaults.Balance) {
+		return fmt.Errorf("defaults.balance: unknown strategy %q (want weighted, least_conn or iphash)", c.Defaults.Balance)
+	}
 	return nil
+}
+
+// upstreamSpecs resolves a rule's upstreams from either `remote` (single) or
+// `remotes` (load-balanced list). Exactly one of the two must be set; each
+// remotes entry may carry an "#weight" suffix.
+func (rs RuleSpec) upstreamSpecs() ([]forward.Upstream, error) {
+	hasRemote := strings.TrimSpace(rs.Remote) != ""
+	hasRemotes := len(rs.Remotes) > 0
+	switch {
+	case hasRemote && hasRemotes:
+		return nil, fmt.Errorf("set either remote or remotes, not both")
+	case hasRemotes:
+		ups := make([]forward.Upstream, 0, len(rs.Remotes))
+		for _, rem := range rs.Remotes {
+			u, err := forward.ParseUpstreams(rem)
+			if err != nil {
+				return nil, err
+			}
+			ups = append(ups, u...)
+		}
+		if len(ups) == 0 {
+			return nil, fmt.Errorf("remotes is empty")
+		}
+		return ups, nil
+	case hasRemote:
+		return forward.ParseUpstreams(rs.Remote)
+	default:
+		return nil, fmt.Errorf("empty remote address (set remote or remotes)")
+	}
 }
 
 // Resolve turns every RuleSpec into a fully-populated forward.Rule by applying
@@ -179,14 +228,18 @@ func (c *Config) Resolve() []forward.Rule {
 		if proto == "" {
 			proto = "tcp"
 		}
+		// upstreamSpecs already passed Validate, so the error is unreachable here.
+		ups, _ := rs.upstreamSpecs()
 		r := forward.Rule{
 			Name:         rs.Name,
 			Proto:        proto,
 			Listen:       rs.Listen,
-			Remote:       rs.Remote,
+			Upstreams:    ups,
+			Balance:      pickStr(rs.Balance, d.Balance),
 			TCPNoDelay:   pickBool(rs.TCPNoDelay, d.TCPNoDelay),
 			KeepAlive:    pickDur(rs.KeepAlive, d.KeepAlive),
 			DialTimeout:  pickDur(rs.DialTimeout, d.DialTimeout),
+			FailCooldown: pickDur(rs.FailCooldown, d.FailCooldown),
 			MaxConns:     pickInt(rs.MaxConns, d.MaxConns),
 			ReadBuffer:   pickInt(rs.ReadBuffer, d.ReadBuffer),
 			WriteBuffer:  pickInt(rs.WriteBuffer, d.WriteBuffer),
@@ -209,6 +262,13 @@ func pickBool(o *bool, def bool) bool {
 }
 
 func pickInt(o *int, def int) int {
+	if o != nil {
+		return *o
+	}
+	return def
+}
+
+func pickStr(o *string, def string) string {
 	if o != nil {
 		return *o
 	}
@@ -283,19 +343,30 @@ defaults:
   tcp_nodelay: true       # disable Nagle for low latency on small payloads
   tcp_keepalive: 30s      # detect dead peers; 0 disables
   dial_timeout: 10s       # give up establishing the upstream after this long
+  balance: weighted       # load-balancing for multi-upstream rules: weighted | least_conn | iphash
+  fail_cooldown: 10s      # park a backend this long after a dial failure before retrying it
   max_connections: 0      # per-rule concurrent connection cap; 0 = unlimited
   read_buffer: 0          # socket SO_RCVBUF in bytes; 0 = OS default
   write_buffer: 0         # socket SO_SNDBUF in bytes; 0 = OS default
-  reuseport: 1            # SO_REUSEPORT listener sockets per rule (>1 scales accepts)
+  reuseport: 1            # SO_REUSEPORT sockets per rule (>1 spreads TCP accepts / UDP receive across cores)
   drain_timeout: 15s      # max wait for in-flight connections on stop/reload
 
 rules:
-  # Expose a remote Redis on local port 6379.
+  # Expose a remote Redis on local port 6379 (single upstream).
   - name: redis
     proto: tcp            # tcp (default) or udp
     listen: ":6379"
     remote: "192.168.1.10:6379"
     # max_connections: 5000   # per-rule override example
+
+  # Load-balance an HTTP API across three backends (the third takes 2x traffic).
+  # - name: api
+  #   listen: ":8080"
+  #   balance: least_conn   # weighted (default) | least_conn | iphash
+  #   remotes:
+  #     - "10.0.0.1:80"
+  #     - "10.0.0.2:80"
+  #     - "10.0.0.3:80#2"
 
   # Forward DNS over UDP.
   # - name: dns
