@@ -47,11 +47,14 @@ Request path: `client → listener (per rule) → handleTCP/serveUDP → upstrea
     per client (symmetric-NAT style), pinned to one balanced upstream for the session,
     idle sessions reaped after 60s.
   - `pool.go` — per-rule load balancer over `Rule.Upstreams`. Lock-free, alloc-free
-    `pick`: `weighted` (round-robin over a weight-expanded index slice), `least_conn`
-    (atomic in-flight counters), `iphash` (FNV of client IP → stable upstream). Passive
-    health only: a failed dial parks a backend via an atomic `downUntil` deadline for
-    `FailCooldown`; callers fail over to the next and retry it after the cooldown. One
-    `pool` is shared across a rule's accept/serve loops so balancing state is global.
+    `pick`: `weighted` (round-robin over a weight-expanded index slice; weights are
+    GCD-reduced and capped by `maxWeight` so `expanded` stays small, and the cursor is
+    sharded across cache lines — selected by the client-key hash — so independent clients
+    don't contend), `least_conn` (atomic in-flight counters, intentionally global),
+    `iphash` (FNV of client IP → stable upstream). Passive health only: a failed dial
+    parks a backend via an atomic `downUntil` deadline for `FailCooldown`; callers fail
+    over to the next and retry it after the cooldown. One `pool` is shared across a rule's
+    accept/serve loops so balancing state is global.
   - `listener_unix.go` / `listener_other.go` — build-tagged socket tuning. Unix sets
     SO_REUSEADDR always and SO_REUSEPORT when `reuseport > 1`. Non-unix degrades reuseport
     to a single listener silently; keep both files in sync when changing `tuneConn`.

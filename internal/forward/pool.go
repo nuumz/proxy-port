@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync/atomic"
 	"time"
 )
@@ -58,20 +59,42 @@ type upstreamState struct {
 	downUntil atomic.Int64
 }
 
+// paddedCursor is a round-robin counter padded to a full cache line so that
+// sharded weighted cursors never sit on the same line — without the padding,
+// two cores advancing "different" cursors would still ping-pong one line
+// (false sharing) and we'd gain nothing from sharding.
+type paddedCursor struct {
+	v atomic.Uint64
+	_ [56]byte // 8 (uint64) + 56 = 64-byte cache line
+}
+
 // pool load-balances new connections/sessions across a rule's upstreams. It is
-// shared by every accept loop / UDP serve loop of a rule, so least_conn and
-// weighted state are global across cores; all hot-path state is atomic.
+// shared by every accept loop / UDP serve loop of a rule; all hot-path state is
+// atomic and the pick path neither locks nor allocates.
 //
 // expanded holds upstream indices repeated by weight (weights [3,1] -> indices
 // [0,0,0,1]); weighted round-robin and iphash index into it, giving O(1)
-// weighted selection with no per-pick allocation or locking.
+// weighted selection. Weights are GCD-reduced first (100:300 -> 1:3) and capped
+// (maxWeight) so expanded stays small regardless of the configured ratio.
+//
+// cursors shards the weighted round-robin counter across cache lines, selected
+// by the client-key hash, so connections from independent clients advance
+// independent counters and never contend. least_conn's inflight counters are
+// intentionally global (that is the semantics) and iphash writes nothing, so
+// only weighted allocates cursors.
 type pool struct {
-	ups      []*upstreamState
-	expanded []int
-	strat    strategy
-	cursor   atomic.Uint64
-	cooldown time.Duration
+	ups       []*upstreamState
+	expanded  []int
+	strat     strategy
+	cursors   []paddedCursor
+	shardMask uint64
+	cooldown  time.Duration
 }
+
+// maxWeight bounds a single upstream's weight so a hostile or fat-fingered
+// config (weight: 1000000000) can't expand into a multi-gigabyte index slice.
+// A 1:1000 ratio is already far beyond any realistic balancing need.
+const maxWeight = 1000
 
 func newPool(ups []Upstream, balance string, cooldown time.Duration, proto string) (*pool, error) {
 	if len(ups) == 0 {
@@ -85,11 +108,18 @@ func newPool(ups []Upstream, balance string, cooldown time.Duration, proto strin
 		cooldown = defaultFailCooldown
 	}
 	p := &pool{strat: strat, cooldown: cooldown}
+
+	// GCD-reduce the weights so equal-ratio configs (2:4, 100:300) expand to the
+	// smallest equivalent slice (1:2, 1:3) instead of their literal sum.
+	g := 0
 	for _, u := range ups {
-		w := u.Weight
-		if w < 1 {
-			w = 1
-		}
+		g = gcd(g, clampWeight(u.Weight))
+	}
+	if g < 1 {
+		g = 1
+	}
+
+	for _, u := range ups {
 		st := &upstreamState{addr: u.Addr}
 		if proto == "udp" {
 			ua, err := net.ResolveUDPAddr("udp", u.Addr)
@@ -100,11 +130,50 @@ func newPool(ups []Upstream, balance string, cooldown time.Duration, proto strin
 		}
 		idx := len(p.ups)
 		p.ups = append(p.ups, st)
-		for k := 0; k < w; k++ {
+		for k := 0; k < clampWeight(u.Weight)/g; k++ {
 			p.expanded = append(p.expanded, idx)
 		}
 	}
+
+	// Shard the weighted cursor across cache lines (rounded up to a power of two
+	// so selection is a mask, not a modulo). Only weighted needs it; least_conn
+	// and iphash leave cursors nil. Capped so a high core count can't balloon
+	// per-rule memory (64 lines = 4 KiB worst case).
+	if strat == stratWeighted {
+		shards := roundUpPow2(runtime.GOMAXPROCS(0))
+		if shards > 64 {
+			shards = 64
+		}
+		p.cursors = make([]paddedCursor, shards)
+		p.shardMask = uint64(shards - 1)
+	}
 	return p, nil
+}
+
+func clampWeight(w int) int {
+	if w < 1 {
+		return 1
+	}
+	if w > maxWeight {
+		return maxWeight
+	}
+	return w
+}
+
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+// roundUpPow2 returns the smallest power of two >= n (and at least 1).
+func roundUpPow2(n int) int {
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return p
 }
 
 func (p *pool) len() int                   { return len(p.ups) }
@@ -153,9 +222,9 @@ func (p *pool) pick(key uint64) (int, bool) {
 		}
 		return 0, false
 
-	default: // weighted round-robin
+	default: // weighted round-robin, sharded by client key to avoid contention
 		m := uint64(len(p.expanded))
-		c := p.cursor.Add(1)
+		c := p.cursors[key&p.shardMask].v.Add(1)
 		for k := uint64(0); k < m; k++ {
 			idx := p.expanded[(c+k)%m]
 			if p.healthy(idx, now) {
