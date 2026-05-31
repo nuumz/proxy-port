@@ -33,6 +33,35 @@ func TestPoolWeighted(t *testing.T) {
 	}
 }
 
+// TestPoolWeightedGCD checks equal-ratio weights expand to the smallest
+// equivalent index slice (2:4 -> 1:2, three entries, not six).
+func TestPoolWeightedGCD(t *testing.T) {
+	p := mkPool(t, BalanceWeighted, time.Second, Upstream{"a", 2}, Upstream{"b", 4})
+	if len(p.expanded) != 3 {
+		t.Errorf("expanded length = %d, want 3 (GCD-reduced 1:2)", len(p.expanded))
+	}
+}
+
+// TestPoolWeightedShardedDistribution checks weighted balancing still honours
+// weights when picks are spread across cursor shards by varying client keys.
+func TestPoolWeightedShardedDistribution(t *testing.T) {
+	p := mkPool(t, BalanceWeighted, time.Second, Upstream{"a", 1}, Upstream{"b", 3})
+	counts := map[string]int{}
+	for i := 0; i < 4000; i++ {
+		idx, ok := p.pick(uint64(i)) // distinct keys -> spread across shards
+		if !ok {
+			t.Fatal("pick failed")
+		}
+		counts[p.addr(idx)]++
+		p.done(idx)
+	}
+	// b should get roughly 3x a; allow slack since shards round-robin independently.
+	ratio := float64(counts["b"]) / float64(counts["a"])
+	if ratio < 2.6 || ratio > 3.4 {
+		t.Errorf("weighted-by-shard distribution %v (b/a=%.2f), want ~3.0", counts, ratio)
+	}
+}
+
 // TestPoolLeastConn checks the second concurrent pick avoids the upstream the
 // first is still holding.
 func TestPoolLeastConn(t *testing.T) {

@@ -70,6 +70,9 @@ func ParseUpstreams(spec string) ([]Upstream, error) {
 			if err != nil || w < 1 {
 				return nil, fmt.Errorf("invalid weight in %q (want a positive integer)", p)
 			}
+			if w > maxWeight {
+				return nil, fmt.Errorf("weight %d in %q exceeds the maximum of %d", w, p, maxWeight)
+			}
 			weight = w
 		}
 		if addr == "" {

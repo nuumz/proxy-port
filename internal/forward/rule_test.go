@@ -27,8 +27,9 @@ func TestParseRule(t *testing.T) {
 		{in: "=remote:1", wantErr: true},
 		{in: ":1=", wantErr: true},
 		{in: "sctp://:1=h:2", wantErr: true},
-		{in: ":1=h:2#0", wantErr: true},   // weight must be >= 1
-		{in: ":1=h:2#abc", wantErr: true}, // weight must be an integer
+		{in: ":1=h:2#0", wantErr: true},      // weight must be >= 1
+		{in: ":1=h:2#abc", wantErr: true},    // weight must be an integer
+		{in: ":1=h:2#100000", wantErr: true}, // weight must be <= maxWeight
 	}
 
 	for _, tt := range tests {
