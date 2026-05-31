@@ -77,3 +77,69 @@ func BenchmarkForwardTCP(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkForwardUDP measures datagram round-trip throughput through the UDP
+// relay. With -benchmem it shows the per-packet allocation profile of the hot
+// path: the netip.AddrPort key and ReadFrom/WriteToUDPAddrPort avoid the
+// per-datagram *net.UDPAddr and String() allocations the demux would otherwise
+// incur, so allocs/op stays low under load.
+func BenchmarkForwardUDP(b *testing.B) {
+	upAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	up, err := net.ListenUDP("udp", upAddr)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer up.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, peer, err := up.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if _, err := up.WriteToUDP(buf[:n], peer); err != nil {
+				return
+			}
+		}
+	}()
+
+	rule := Rule{
+		Proto: "udp", Listen: "127.0.0.1:0", Remote: up.LocalAddr().String(),
+		DialTimeout: time.Second, ReusePort: 1, DrainTimeout: time.Second,
+	}
+	probe, _ := net.ListenUDP("udp", upAddr)
+	rule.Listen = probe.LocalAddr().String()
+	probe.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rr := newRuleRunner(rule, false)
+	if err := rr.start(ctx); err != nil {
+		b.Fatalf("start: %v", err)
+	}
+	defer rr.stop(time.Second)
+
+	payload := make([]byte, 64)
+	b.ResetTimer()
+	b.SetBytes(int64(len(payload)) * 2)
+	b.RunParallel(func(pb *testing.PB) {
+		conn, err := net.Dial("udp", rule.Listen)
+		if err != nil {
+			b.Error(err)
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, len(payload))
+		for pb.Next() {
+			if _, err := conn.Write(payload); err != nil {
+				b.Error(err)
+				return
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}

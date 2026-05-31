@@ -29,30 +29,30 @@ func handleTCP(ctx context.Context, id uint64, client net.Conn, r Rule, verbose 
 	// Force both ends closed if the runner context is cancelled — that only
 	// happens once stop() has exceeded its drain window, and closing the conns
 	// is what unblocks the io.Copy calls below so a straggler can't outlive the
-	// drain timeout. The watcher exits promptly via done on normal completion.
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = client.Close()
-			_ = upstream.Close()
-		case <-done:
-		}
-	}()
+	// drain timeout. context.AfterFunc keeps no goroutine alive while the
+	// connection is live (unlike a per-conn watcher goroutine), so this costs
+	// nothing per in-flight conn; the cleanup runs once, only on cancel. stop
+	// deregisters it on normal completion (its return value is irrelevant: the
+	// Close calls are idempotent).
+	stop := context.AfterFunc(ctx, func() {
+		_ = client.Close()
+		_ = upstream.Close()
+	})
+	defer stop()
 
 	if verbose {
 		log.Printf("[%s#%d] open %s <-> %s", r.Listen, id, client.RemoteAddr(), upstream.RemoteAddr())
 	}
 
-	// Relay both directions concurrently. io.Copy on *net.TCPConn uses the
-	// splice(2) syscall on Linux, moving bytes in-kernel with no userspace
-	// buffer. When one side closes we half-close the other so EOF propagates
-	// cleanly, then return once both copies finish.
+	// Relay both directions. io.Copy on *net.TCPConn uses the splice(2) syscall
+	// on Linux, moving bytes in-kernel with no userspace buffer. We run one
+	// direction inline in this goroutine and spawn just one more for the other,
+	// saving a goroutine per connection. When one side closes we half-close the
+	// other so EOF propagates cleanly, then return once both copies finish.
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 	go func() { defer wg.Done(); pipe(upstream, client) }()
-	go func() { defer wg.Done(); pipe(client, upstream) }()
+	pipe(client, upstream)
 	wg.Wait()
 
 	if verbose {
